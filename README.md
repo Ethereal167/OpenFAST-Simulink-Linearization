@@ -1,0 +1,2 @@
+# OpenFAST-Simulink-Linearization
+OpenFAST与Simulink联合仿真，NREL5MW风电机组在Simulink中的线性化模型
