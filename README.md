@@ -1,5 +1,5 @@
 # OpenFAST-Simulink-Linearization
-OpenFAST与Simulink联合仿真，NREL5MW风电机组在Simulink中的线性化模型
+OpenFAST与Simulink联合仿真，在Simulink中构造独立变桨-模型预测控制器（IPC-MPC）
 
 仿真基于OpenFAST v3.4.0
 1. 打开Matlab_Toolbox文件夹下的runFAST.m，根据自己电脑的路径重新设置文件路径，点击运行即可
