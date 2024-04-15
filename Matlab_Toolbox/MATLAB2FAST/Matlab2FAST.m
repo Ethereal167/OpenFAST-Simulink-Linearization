@@ -1,0 +1,611 @@
+% Matlab2FAST(FastPar,TemplateFile,OutputFilename,hdrLines)
+% Function for creating a new FAST file given:
+% 1) An input template file
+% 2) A FAST parameter structure
+%
+% In:   FastPar         -   A FAST parameter list
+%       TemplateFile    -   A .fst file to use as a template
+%       OutputFilename  -   Desired filename of output .fst file
+%
+% Paul Fleming, JUNE 2011
+% Using code copied from functions written by Knud Kragh
+% Modified by Bonnie Jonkman, Feb 2013
+% Modified by Paul Schünemann, July 2020 (to allow us to write MoorDyn files, too)
+% Note: the template must not contain the string "OutList" anywhere
+%  except for the actual "OutList" output parameter lists.
+
+function Matlab2FAST(FastPar,TemplateFile,OutputFilename,hdrLines)
+
+if nargin < 4
+    hdrLines = 0;
+end
+
+% we're going to get the appropriate newline character(s) from the template file
+
+HaveNewLineChar = false;
+ContainsOutList = false;
+
+%Declare file IDs from the template to the resulting file
+fidIN = fopen(TemplateFile,'r');
+if fidIN == -1
+    error([' Template file, ' TemplateFile ', not found.'])
+end
+fidOUT = fopen(OutputFilename,'w');
+if fidOUT == -1
+    error(['Can''t create file ' OutputFilename])
+end
+
+for hi = 1:hdrLines
+    line    = fgets(fidIN); 
+    
+        % get the line feed characters(s) here: char(13)=CR(\r) char(10)=LF(\n)
+        % so our file has consistant line endings
+    if ~HaveNewLineChar
+        newline = getNewlineChar(line);
+        HaveNewLineChar = true;
+    end
+
+        % print appropriate header lines:
+    if isfield(FastPar, 'HdrLines') && hi ~= 1 && hi <= length(FastPar.HdrLines) %first line always comes from template file
+        fprintf(fidOUT,'%s',FastPar.HdrLines{hi,1}); %does not contain the line ending
+        fprintf(fidOUT,newline);                     %so print it here instead
+    else
+        fprintf(fidOUT,'%s',line);
+    end
+end
+
+printTable = false; %assume we'll get the tables from the FastPar data structure;
+printTableComments = 0;
+NextMatrix = '';
+isInteger = false;
+iOutList = 1;
+
+
+%loop through the template up until OUTLIST, OUTPUTS (for MoorDyn files) or end of file
+while true
+    
+    line = fgets(fidIN); %get the next line from the template
+    
+    if isnumeric(line) %we reached the end of the file
+        break;
+    end
+    
+        % get the line feed characters(s) here: CHAR(13)=CR(\r) CHAR(10)=LF(\n)
+        % so our file has consistant line endings
+    if ~HaveNewLineChar
+        newline = getNewlineChar(line);
+        HaveNewLineChar = true;
+    end
+    
+    if containString(upper(line),'OUTLIST') || (containString(upper(line),'OUTPUTS') && isfield(FastPar,'ConProp')) % The second statement is to detect the outlist of MoorDyn input files (Field ConProp will only exist when processing MoorDyn input files.)
+        % 6/23/2016: linearization inputs contain "OutList" in the
+        % comments, so we need to make sure this is either the first (value) or
+        % second (label) word of the line.
+        [value2, ~, ~, nextindex] = sscanf(line,'%s', 1); 
+        [value3] = sscanf(line(nextindex+1:end),'%s', 1); 
+        
+        if strcmpi(value2,'OutList') || strcmpi(value2,'OUTPUTS') || strcmpi(value2,'OutListAD') ||strcmpi(value3,'OutList') || strcmpi(value3,'OUTPUTS') || strcmpi(value3,'OutListAD')
+            fprintf(fidOUT,'%s',line); %if we've found OutList, write the line and break
+
+            if isfield(FastPar,'OutList') && length(FastPar.OutList) >= iOutList
+                OutListChar = char(FastPar.OutList{iOutList});  %this will line up the comments nicer
+                spaces      = repmat(' ',1,max(1,26-size(OutListChar,2)));
+                %Now add the Outlist
+                for io = 1:length(FastPar.OutList{iOutList})
+                    fprintf(fidOUT,'%s',[OutListChar(io,:) spaces FastPar.OutListComments{iOutList}{io} newline]);
+                end
+            else
+                disp( 'WARNING: OutList was not found in the FAST data structure. The OutList field will be empty.' );        
+            end
+
+            while ~startsWithString(line,"END") && ~isnumeric(line)
+                line = fgets(fidIN); %get the next line from the template, including newline character
+            end
+
+            if isnumeric(line)
+                fprintf(fidOUT,'END of input file (the word "END" must appear in the first 3 columns of this last OutList line)'); 
+                fprintf(fidOUT,newline); 
+            else
+                fprintf(fidOUT,line);
+            end
+            iOutList = iOutList + 1;
+
+
+            continue; %let's continue reading the template file           
+        end
+          
+    end      
+    
+   
+    [value, label, isComment, ~, ~] = ParseFASTInputLine(line);
+    
+            
+    if ~printTable && ~isComment && ~isempty(label)        
+        
+        if ~isempty(NextMatrix)                
+            WriteFASTMatrix( FastPar, fidOUT, NextMatrix, newline, isInteger )
+            NextMatrix = '';
+        end
+        
+        if strcmpi(value,'"HtFract"') || strcmpi(value,'"TwrElev"') %we've reached the distributed tower properties table (and we think it's a string value so it's in quotes)            
+            if ~isfield(FastPar,'TowProp')
+                disp(  'WARNING: tower properties table not found in the FAST data structure.' );
+                printTable = true;
+            else
+                WriteFASTTable(line, fidIN, fidOUT, FastPar.TowProp, newline);
+                continue; %let's continue reading the template file            
+            end
+
+        elseif strcmpi(value,'"BlFract"') %we've reached the distributed blade properties table (and we think it's a string value so it's in quotes)
+            if ~isfield(FastPar,'BldProp')
+                disp( 'WARNING: blade properties table not found in the FAST data structure.' );
+                printTable = true;
+            else
+                WriteFASTTable(line, fidIN, fidOUT, FastPar.BldProp, newline);
+                continue; %let's continue reading the template file            
+            end
+            
+        elseif strcmpi(label,'F_X') %we've reached the TMD spring forces table
+            if ~isfield(FastPar,'TMDspProp')
+                disp( 'WARNING: TMD spring forces table not found in the FAST data structure.' );
+                printTable = true;
+            else
+                WriteFASTTable(line, fidIN, fidOUT, FastPar.TMDspProp, newline);
+                continue; %let's continue reading the template file            
+            end
+            
+        elseif strcmpi(value,'"GenSpd_TLU"') %we've reached the DLL torque-speed lookup table (and we think it's a string value so it's in quotes)
+            if ~isfield(FastPar,'DLLProp')
+                disp( 'WARNING: Bladed Interface torque-speed look-up table not found in the FAST data structure.' );
+                printTable = true;
+            else
+                WriteFASTTable(line, fidIN, fidOUT, FastPar.DLLProp, newline);
+                continue; %let's continue reading the template file            
+            end            
+            
+        elseif strcmpi(label,'FoilNm') || strcmpi(label,'AFNames') %we've reached the airfoil names
+            if ~isfield(FastPar,'FoilNm')
+                disp( 'WARNING: AeroDyn airfoil list not found in the FAST data structure.' );
+                printTable = true;
+            else
+                WriteFASTFileList(line, fidIN, fidOUT, FastPar.FoilNm, label, newline);
+                continue; %let's continue reading the template file            
+            end                                     
+            
+        elseif strcmpi(label,'NumAlf')  %we've reached the airfoil coefficients
+            line = GetLineToWrite( line, FastPar, label, TemplateFile, value );
+            fprintf(fidOUT,'%s',line);
+            
+            line = fgets(fidIN); %get the next line from the template
+            if ~isfield(FastPar,'AFCoeff')
+                disp( 'WARNING: AeroDyn airfoil coefficients not found in the FAST data structure.' );
+                printTable = true;
+            else                
+                WriteFASTTable(line, fidIN, fidOUT, FastPar.AFCoeff, newline, 1);
+            end            
+            continue; %let's continue reading the template file            
+            
+        elseif strcmpi(label,'NumPointLoads')  % BeamDyn driver point-load table
+            line = GetLineToWrite( line, FastPar, label, TemplateFile, value );                
+            fprintf(fidOUT,'%s',line);
+            
+            if ~isfield(FastPar,'PointLoads')
+                disp( 'WARNING: BeamDyn driver point loads not found in the FAST data structure.' );
+                printTable = true;
+                printTableComments = 2;
+            else                
+                line = fgets(fidIN); %get the next (header) line from the template
+                WriteFASTTable(line, fidIN, fidOUT, FastPar.PointLoads, newline, 1);
+            end            
+            continue; %let's continue reading the template file            
+            
+        elseif strcmpi(value,'"RNodes"') %we've reached the AeroDyn Blade properies table (and we think it's a string value so it's in quotes)
+            if ~isfield(FastPar,'BldNodes')
+                disp( 'WARNING: AeroDyn blade properties table not found in the FAST data structure.' );
+                printTable = true;
+            else
+                IntegerCols = {'NFoil'};
+                WriteFASTTable(line, fidIN, fidOUT, FastPar.BldNodes, newline, 0, IntegerCols);
+                continue; %let's continue reading the template file            
+            end   
+            
+        elseif strcmpi(value,'"BlSpn"') %we've reached the AeroDyn15 Blade properies table (and we think it's a string value so it's in quotes)
+            if ~isfield(FastPar,'BldNodes')
+                disp( 'WARNING: AeroDyn blade properties table not found in the FAST data structure.' );
+                printTable = true;
+            else
+                IntegerCols = {'BlAFID'};
+                WriteFASTTable(line, fidIN, fidOUT, FastPar.BldNodes, newline, 1, IntegerCols);
+                continue; %let's continue reading the template file            
+            end   
+            
+        elseif strcmpi(label,'kp_yr') %we've reached the BD key-points table
+            if ~isfield(FastPar,'kp')
+                disp( 'WARNING: BeamDyn key-point table not found in the FAST data structure.' );
+                printTable = true;
+            else
+                WriteFASTTable(line, fidIN, fidOUT, FastPar.kp, newline, 1);
+                continue; %let's continue reading the template file            
+            end   
+            
+        elseif strcmpi(label,'StdScale3') %we've reached the TurbSim profile table
+            line = GetLineToWrite( line, FastPar, label, TemplateFile, value );
+            fprintf(fidOUT,'%s',line);
+
+            for i=1:3
+                line = fgets(fidIN); %get the next line from the template
+                fprintf(fidOUT,'%s',line);           % print the comment line
+            end
+            line = fgets(fidIN); %get the next line from the template
+
+            if ~isfield(FastPar,'profile')
+                disp( 'WARNING: TurbSim profile table not found in the FAST data structure.' );
+                printTable = true;
+                printTableComments = 2;
+            else
+                WriteFASTTable(line, fidIN, fidOUT, FastPar.profile, newline, 0);
+                continue; %let's continue reading the template file            
+            end
+        elseif strcmpi(value,'"WndSpeed"') %we've reached the cases table (and we think it's a string value so it's in quotes)
+            if ~isfield(FastPar,'Cases')
+                disp( 'WARNING: AeroDyn driver cases properties table not found in the FAST data structure.' );
+                printTable = true;
+            else
+                WriteFASTTable(line, fidIN, fidOUT, FastPar.Cases, newline);
+                continue; %let's continue reading the template file            
+            end   
+            
+        elseif strcmpi(label,'NOPRINT') || strcmpi(label,'PRINT')
+            continue;  % this comes from AeroDyn BldNodes table                                    
+
+        elseif strcmpi(value,'"Name"') %we've reached the MoorDyn line types table (and we think it's a string value so it's in quotes)
+            if ~isfield(FastPar,'LineTypes')
+                disp( 'WARNING: MoorDyn line types table not found in the FAST data structure.' );
+                printTable = true;
+            else
+                WriteFASTTable(line, fidIN, fidOUT, FastPar.LineTypes, newline, 1); %write the MoorDyn line types table 
+                for k = 1:NTypes_old
+                    fgets(fidIN); %skip the table content from the template file, i.e. prevent it from being written in the new file
+                end                
+                continue; %let's continue reading the template file            
+            end   
+        elseif strcmpi(value,'"Node"') %we've reached the MoorDyn connection properties table (and we think it's a string value so it's in quotes)
+            if ~isfield(FastPar,'ConProp')
+                disp( 'WARNING: MoorDyn connection properties table not found in the FAST data structure.' );
+                printTable = true;
+            else
+                IntegerCols = {'Node'};
+                WriteFASTTable(line, fidIN, fidOUT, FastPar.ConProp, newline, 1, IntegerCols); %write the MoorDyn connection properties table
+                for k = 1:NConnects_old
+                    fgets(fidIN); %skip the table content from the template file, i.e. prevent it from being written in the new file
+                end
+                continue; %let's continue reading the template file            
+            end
+        elseif strcmpi(value,'"Line"') %we've reached the MoorDyn line properties table (and we think it's a string value so it's in quotes)
+            if ~isfield(FastPar,'LineProp')
+                disp( 'WARNING: MoorDyn line properties table not found in the FAST data structure.' );
+                printTable = true;
+            else
+                IntegerCols = {'Line','NumSegs','NodeAnch','NodeFair'};
+                WriteFASTTable(line, fidIN, fidOUT, FastPar.LineProp, newline, 1, IntegerCols); %write the MoorDyn line properties table
+                for k = 1:NLines_old
+                    fgets(fidIN); %skip the table content from the template file, i.e. prevent it from being written in the new file
+                end                
+                continue; %let's continue reading the template file            
+            end
+            
+        else
+
+            line = GetLineToWrite( line, FastPar, label, TemplateFile, value );
+
+            if strcmpi(label,'GlbPos(3)')
+                NextMatrix = 'DCM';
+                isInteger  = false;
+            elseif strcmpi(label,'kp_total')
+                NextMatrix = 'MemberKeyPtTable';
+                isInteger  = true;
+            elseif strcmpi(label,'NTypes') %we've reached MoorDyn parameter NTypes, so we save its value from the template file to be able to skip the table content from the template file when writing the new file
+                NTypes_old = value;
+            elseif strcmpi(label,'NConnects') %we've reached MoorDyn parameter NConnects, so we save its value from the template file to be able to skip the table content from the template file when writing the new file
+                NConnects_old = value;
+            elseif strcmpi(label,'NLines') %we've reached MoorDyn parameter NLines, so we save its value from the template file to be able to skip the table content from the template file when writing the new file
+                NLines_old = value;
+            end            
+                
+        end
+        
+    else % isComment || length(label) == 0 || printTable (i.e. tables must end with comments)
+        if isComment
+            if printTableComments == 0
+                printTable = false;     % we aren't reading a table (if we were, we reached the end)
+            else
+                printTableComments = printTableComments - 1;
+            end
+        else
+            if ~isempty(NextMatrix)                
+                WriteFASTMatrix( FastPar, fidOUT, NextMatrix, newline, isInteger )
+                NextMatrix = '';
+            end
+            continue;           % don't print this line without a label (or inside a table)
+        end
+    end       
+    
+    %write this line into the output file
+    fprintf(fidOUT,'%s',line);
+end
+
+if ContainsOutList
+    if isfield(FastPar,'OutList')
+        OutListChar = char(FastPar.OutList);  %this will line up the comments nicer
+        spaces      = repmat(' ',1,max(1,26-size(OutListChar,2)));
+        %Now add the Outlist
+        for io = 1:length(FastPar.OutList)
+            fprintf(fidOUT,'%s',[OutListChar(io,:) spaces FastPar.OutListComments{io} newline]);
+        end
+    else
+        disp( 'WARNING: OutList was not found in the FAST data structure. The OutList field will be empty.' );        
+    end
+
+        %Now add the close of file
+    fprintf(fidOUT,'---------------------------------------------------------------------------------------');
+    fprintf(fidOUT,newline);
+end
+
+fclose(fidIN);
+fclose(fidOUT);
+return;
+end %end function
+
+function [line] = GetLineToWrite( line, FastPar, label, TemplateFile, value )
+
+    indx = strcmpi( FastPar.Label, label );
+    if any( indx )
+
+        if sum(indx) > 1 % we found more than one....
+%             vals2Write = FastPar.Val{indx};
+            disp( ['WARNING: multiple occurrences of ' label ' in the FAST data structure.'] );
+        end
+
+        % The template label matches a label in FastPar
+        %  so let's use the old value.
+        indx2 = find(indx,1,'first');
+
+        writeVal = getWriteVal( FastPar.Val{indx2} );     
+
+        idx = strfind( line, label ); %let's just take the line starting where the label is first listed            
+        line = [writeVal '   ' line(idx(1):end)];            
+
+    else
+        disp( ['WARNING: ' label ' not found in the FAST data structure. Default value listed below (from template file, ' TemplateFile ') will be used instead:'] )
+        disp( value );
+        disp( '' );            
+    end
+
+
+return;
+end
+
+function [writeVal] = getNumericVal2Write( val2Write, fmt )
+    writeVal = sprintf(fmt,val2Write(1));
+    if ~isscalar(val2Write) %Check for the special case of an array
+        writeVal = [writeVal sprintf([',' fmt],val2Write(2:end)) ' '];
+    end
+    return;
+end
+
+function [writeVal] = getWriteVal( val2Write )
+
+        % print the old value at the start of the line,
+        % using an appropriate format
+    if isnumeric(val2Write)
+        if all( int32(val2Write)==val2Write )
+            % this is an exact integer, so we'll use a different format
+            fmt  = '%11.0f';
+            fmt1 = '%15.0f';
+        else
+            fmt  = '%11G';
+            fmt1 = '%15G';
+        end
+        writeVal= getNumericVal2Write( val2Write, fmt );
+        if isscalar(writeVal) && any( str2num(writeVal) ~= val2Write ) %we're losing precision here!!!
+            writeVal=getNumericVal2Write( val2Write, fmt1 );
+            disp(writeVal)
+            disp(str2num(writeVal))
+        end
+    else
+        writeVal = [val2Write repmat(' ',1,max(1,11-length(val2Write)))];
+    end
+
+end
+
+function WriteFASTTable( HdrLine, fidIN, fidOUT, TableIn, newline, NumUnitLines, IntegerCols )
+
+    % we've read the line of the template table that includes the header 
+    % let's parse it now:
+    if strncmp(HdrLine,'--------------------------------------------', 20)
+        % this assumes we are using TurbSim profiles file
+        nc = size(TableIn.Table,2); 
+    else
+                       
+        while startsWithString(HdrLine, '!') % remove comment characters at beginning of line
+            HdrLine = HdrLine(2:end);
+        end
+        indx = strfind(HdrLine,'!'); % remove comments at end of header
+        if ~isempty(indx)
+            lastIndx = indx(1)-1;
+        else
+            lastIndx = length(HdrLine);
+        end
+
+        if lastIndx > 1 && containString(HdrLine(1:lastIndx),',')
+            % these will be assumed to be comma delimited:
+            TmpHdr  = textscan(HdrLine(1:lastIndx),'%s', 'Delimiter',',');
+        else
+            TmpHdr  = textscan(HdrLine(1:lastIndx),'%s');
+        end
+
+        TemplateHeaders = TmpHdr{1};
+        nc = length(TemplateHeaders);
+    end
+
+    
+    fprintf(fidOUT,'%s',HdrLine);           % print the new headers
+
+    if nargin < 6 
+        NumUnitLines = 1;
+    end
+    
+    for i=1:NumUnitLines
+        fprintf(fidOUT,'%s',fgets(fidIN));      % print the new units (we're assuming they are the same)
+    end
+        
+    if ~iscell(TableIn.Table) && size(TableIn.Table,1) < 1
+        return
+    end
+    
+    if strcmpi(TemplateHeaders{1}, 'Name') || strcmpi(TemplateHeaders{1}, 'Node') || strcmpi(TemplateHeaders{1}, 'Line')
+        % We are dealing with a MoorDyn input file, so let's adjust the
+        % format specifier to get a nice readable table.
+        colFmtR='%-8G ';
+        colFmtI='  %-5i ';
+        colFmtS='%-9s ';
+    else
+        colFmtR='%11.7E  ';
+        colFmtI='%9i      ';
+        colFmtS='%s ';
+    end
+    
+    if nargin < 7
+        IntegerCols={};
+    end
+    
+    % let's figure out which columns in the old Table match the headers
+    % in the new table:
+    colIsInteger = false(1,nc);        
+    if isempty(TableIn.Headers)
+        ColIndx = 1:nc;
+    else
+        ColIndx = ones(1,nc);
+        
+        for i=1:nc
+            indx = strcmpi(TemplateHeaders{i}, TableIn.Headers);
+            if sum(indx) > 0
+                ColIndx(i) = find(indx,1,'first');
+                if sum(indx) ~= 1
+                    disp( ['WARNING: Multiple instances of ' TemplateHeaders{i} ' column found in FAST table.'] );
+                end
+
+                indx2 = strcmpi(TemplateHeaders{i},IntegerCols);
+                colIsInteger(i) = sum(indx2)>0;
+
+            else
+                if i==nc
+                    disp( [ TemplateHeaders{i} ' column not found in FAST table. Last column(s) will be missing.'] );                
+                    nc = i-1;
+                    break
+                else
+                    error( [ TemplateHeaders{i} ' column not found in FAST table. Cannot write the table.'] );
+                end
+            end                
+        end
+    end
+    
+    ColIndx=ColIndx(1:nc);
+    
+    % now we'll write the table:    
+    if iscell(TableIn.Table)
+        for i=1:size(TableIn.Table,1)
+            for j=ColIndx
+                if isnumeric(TableIn.Table{i,j})
+                    if colIsInteger(j)
+                        fmt = colFmtI;
+                    else
+                        fmt = colFmtR;
+                    end
+                else                    
+                    fmt = colFmtS;
+                end
+                fprintf(fidOUT, fmt, TableIn.Table{i,j} );
+            end
+            fprintf(fidOUT, '%s', TableIn.Comments{i}); % print any comments that may exist for this line
+            fprintf(fidOUT, newline);
+        end        
+    else        
+        for i=1:size(TableIn.Table,1) 
+            fprintf(fidOUT, '%11.7E  ', TableIn.Table(i,ColIndx) );  %write all of the columns
+            fprintf(fidOUT, newline);
+        end
+    end    
+end
+
+
+function WriteFASTFileList( line, fidIN, fidOUT, List, label, newline )
+
+        % print the old value at the start of the line,
+        % using an appropriate format
+    writeVal = getWriteVal( List{1} );     
+
+
+    idx = strfind( line, label ); %let's just take the line starting where the label is first listed            
+    line = [writeVal '   ' line(idx(1):end)];    
+
+    fprintf(fidOUT,'%s',line);              % print the first value in the list, including the label
+    for i=2:length(List)
+        if isnumeric(List{i})
+            fprintf(fidOUT,'%11G',List{i});
+        else
+            fprintf(fidOUT,'%s',List{i});         
+        end
+        fprintf(fidOUT,newline);
+    end
+end
+
+function WriteFASTMatrix( FastPar, fidOUT, matrixName, newline, UseIntFormat )
+
+    indx = strcmpi( FastPar.Label, matrixName );
+    indx2 = find(indx,1,'first');
+    matrix = FastPar.Val{indx2};               
+                
+    if UseIntFormat
+        fmt = '%6i ';
+    else
+        fmt = '%11.7E  ';
+    end
+    % now we'll write the table:    
+    for i=1:size(matrix,1) 
+        fprintf(fidOUT, fmt, matrix(i,:) );  %write all of the columns
+        if (i == 1 && strcmpi(matrixName,'MemberKeyPtTable'))
+            fprintf(fidOUT, '                - Member number; Number of key points in this member');
+        end
+        fprintf(fidOUT, newline);
+    end
+    return;
+end
+
+
+function [newline] = getNewlineChar(line)
+
+    indx = strfind(line,char(10));
+    cr_indx = strfind(line,char(13));
+    if isempty( indx ) 
+        indx = cr_indx;
+    else
+        if ~isempty(cr_indx)
+            indx = min( indx, cr_indx );
+        end
+    end
+    
+    if isempty( indx )
+        if ismac
+            newline = char(13); % '\r'; %mac
+        elseif isunix
+            newline = char(10); % '\n'; %linux
+        else % ispc
+            newline = [char(13) char(10)]; % '\r\n'; %windows
+        end
+    else
+        newline = line(indx:end);
+    end
+    
+    return;
+end
